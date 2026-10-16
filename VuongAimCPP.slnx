@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="VuongAimCPP/VuongAimCPP.vcxproj" Id="caf63717-29f3-4fa4-ab00-9e12b2385641" />
+</Solution>
