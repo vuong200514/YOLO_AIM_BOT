@@ -1,20 +1,23 @@
 ﻿#include "YoloEngine.h"
 #include <fstream>
+#include <iostream>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
 
-#define checkCuda(status) { status; }
+void Logger::log(Severity severity, const char* msg) noexcept {
+    if (severity <= Severity::kERROR && msg) std::cerr << "TensorRT: " << msg << '\n';
+}
 
 struct NMSBox {
     float x1, y1, x2, y2;
     float score;
-    int class_id;
     float area;
+    int class_id;
 };
 
-YoloEngine::YoloEngine() {
-    m_buffers[0] = nullptr;
-    m_buffers[1] = nullptr;
-}
+YoloEngine::YoloEngine() = default;
 
 YoloEngine::~YoloEngine() {
     if (m_CudaGraphInstance) cudaGraphExecDestroy(m_CudaGraphInstance);
@@ -24,137 +27,203 @@ YoloEngine::~YoloEngine() {
     if (m_PinnedOutput) cudaFreeHost(m_PinnedOutput);
     if (m_buffers[0]) cudaFree(m_buffers[0]);
     if (m_buffers[1]) cudaFree(m_buffers[1]);
-    if (m_Context) delete m_Context;
-    if (m_Engine) delete m_Engine;
-    if (m_Runtime) delete m_Runtime;
+    delete m_Context;
+    delete m_Engine;
+    delete m_Runtime;
+}
+
+bool YoloEngine::CheckCuda(cudaError_t status, const char* operation) const {
+    if (status == cudaSuccess) return true;
+    std::cerr << "CUDA " << operation << ": " << cudaGetErrorString(status) << '\n';
+    return false;
 }
 
 bool YoloEngine::Initialize(const std::string& enginePath) {
-    std::ifstream file(enginePath, std::ios::binary);
-    if (!file.good()) return false;
-    file.seekg(0, file.end);
-    size_t size = file.tellg();
-    file.seekg(0, file.beg);
-    char* trtModelStream = new char[size];
-    file.read(trtModelStream, size);
-    file.close();
+    std::ifstream file(enginePath, std::ios::binary | std::ios::ate);
+    if (!file) {
+        std::cerr << "Cannot open engine: " << enginePath << '\n';
+        return false;
+    }
+
+    const std::streamsize length = file.tellg();
+    if (length <= 0) return false;
+    file.seekg(0, std::ios::beg);
+    std::vector<char> serialized(static_cast<size_t>(length));
+    if (!file.read(serialized.data(), length)) return false;
 
     m_Runtime = createInferRuntime(m_Logger);
-    m_Engine = m_Runtime->deserializeCudaEngine(trtModelStream, size);
-    delete[] trtModelStream;
+    if (!m_Runtime) return false;
+    m_Engine = m_Runtime->deserializeCudaEngine(serialized.data(), serialized.size());
     if (!m_Engine) return false;
-
     m_Context = m_Engine->createExecutionContext();
+    if (!m_Context) return false;
+    if (m_Engine->getNbIOTensors() != 2) {
+        std::cerr << "Engine must contain exactly one input and one output tensor\n";
+        return false;
+    }
 
-    checkCuda(cudaStreamCreate(&m_Stream));
+    const char* inputName = nullptr;
+    const char* outputName = nullptr;
+    for (int i = 0; i < m_Engine->getNbIOTensors(); ++i) {
+        const char* name = m_Engine->getIOTensorName(i);
+        if (m_Engine->getTensorIOMode(name) == TensorIOMode::kINPUT) inputName = name;
+        if (m_Engine->getTensorIOMode(name) == TensorIOMode::kOUTPUT) outputName = name;
+    }
+    if (!inputName || !outputName) return false;
+    if (m_Engine->getTensorDataType(inputName) != DataType::kFLOAT ||
+        m_Engine->getTensorDataType(outputName) != DataType::kFLOAT) {
+        std::cerr << "Engine I/O must be FP32; internal FP16 layers are supported\n";
+        return false;
+    }
 
-    size_t inputBytes = 3 * INPUT_W * INPUT_H * sizeof(float);
-    size_t outputBytes = (4 + NUM_CLASSES) * NUM_ANCHORS * sizeof(float);
+    const Dims inDims = m_Engine->getTensorShape(inputName);
+    const Dims outDims = m_Engine->getTensorShape(outputName);
+    auto volume = [](const Dims& dims) -> int64_t {
+        int64_t product = 1;
+        if (dims.nbDims <= 0) return -1;
+        for (int i = 0; i < dims.nbDims; ++i) {
+            if (dims.d[i] <= 0) return -1;
+            product *= dims.d[i];
+        }
+        return product;
+        };
 
-    checkCuda(cudaMalloc(&m_buffers[0], inputBytes));
-    checkCuda(cudaMalloc(&m_buffers[1], outputBytes));
+    if (volume(inDims) != static_cast<int64_t>(3 * INPUT_W * INPUT_H) ||
+        volume(outDims) != static_cast<int64_t>((4 + NUM_CLASSES) * NUM_ANCHORS)) {
+        std::cerr << "Tensor shape incompatible with 128x128 YOLO model\n";
+        return false;
+    }
 
-    checkCuda(cudaMallocHost((void**)&m_PinnedInput, inputBytes));
-    checkCuda(cudaMallocHost((void**)&m_PinnedOutput, outputBytes));
+    const size_t inputBytes = static_cast<size_t>(3 * INPUT_W * INPUT_H) * sizeof(float);
+    const size_t outputBytes = static_cast<size_t>((4 + NUM_CLASSES) * NUM_ANCHORS) * sizeof(float);
+    if (!CheckCuda(cudaStreamCreateWithFlags(&m_Stream, cudaStreamNonBlocking), "stream")) return false;
+    if (!CheckCuda(cudaMalloc(&m_buffers[0], inputBytes), "input alloc")) return false;
+    if (!CheckCuda(cudaMalloc(&m_buffers[1], outputBytes), "output alloc")) return false;
+    if (!CheckCuda(cudaMallocHost(reinterpret_cast<void**>(&m_PinnedInput), inputBytes), "pinned input")) return false;
+    if (!CheckCuda(cudaMallocHost(reinterpret_cast<void**>(&m_PinnedOutput), outputBytes), "pinned output")) return false;
 
-    m_Context->setTensorAddress(m_Engine->getIOTensorName(0), m_buffers[0]);
-    m_Context->setTensorAddress(m_Engine->getIOTensorName(1), m_buffers[1]);
+    if (!m_Context->setTensorAddress(inputName, m_buffers[0])) return false;
+    if (!m_Context->setTensorAddress(outputName, m_buffers[1])) return false;
+    return true;
+}
 
+bool YoloEngine::ExecuteDirect() {
+    const size_t inBytes = static_cast<size_t>(3 * INPUT_W * INPUT_H) * sizeof(float);
+    const size_t outBytes = static_cast<size_t>((4 + NUM_CLASSES) * NUM_ANCHORS) * sizeof(float);
+    if (!CheckCuda(cudaMemcpyAsync(m_buffers[0], m_PinnedInput, inBytes, cudaMemcpyHostToDevice, m_Stream), "copy input")) return false;
+    if (!m_Context->enqueueV3(m_Stream)) {
+        std::cerr << "TensorRT enqueueV3 failed\n";
+        return false;
+    }
+    if (!CheckCuda(cudaMemcpyAsync(m_PinnedOutput, m_buffers[1], outBytes, cudaMemcpyDeviceToHost, m_Stream), "copy output")) return false;
+    return CheckCuda(cudaStreamSynchronize(m_Stream), "stream synchronize");
+}
+
+bool YoloEngine::CaptureGraph() {
+    const size_t inBytes = static_cast<size_t>(3 * INPUT_W * INPUT_H) * sizeof(float);
+    const size_t outBytes = static_cast<size_t>((4 + NUM_CLASSES) * NUM_ANCHORS) * sizeof(float);
+    if (cudaStreamBeginCapture(m_Stream, cudaStreamCaptureModeGlobal) != cudaSuccess) return false;
+
+    bool succeeded = true;
+    succeeded = succeeded && cudaMemcpyAsync(m_buffers[0], m_PinnedInput, inBytes, cudaMemcpyHostToDevice, m_Stream) == cudaSuccess;
+    if (succeeded) succeeded = m_Context->enqueueV3(m_Stream);
+    if (succeeded) succeeded = cudaMemcpyAsync(m_PinnedOutput, m_buffers[1], outBytes, cudaMemcpyDeviceToHost, m_Stream) == cudaSuccess;
+
+    cudaGraph_t graph = nullptr;
+    const cudaError_t status = cudaStreamEndCapture(m_Stream, &graph);
+    if (!succeeded || status != cudaSuccess || !graph) {
+        if (graph) cudaGraphDestroy(graph);
+        return false;
+    }
+
+    cudaGraphExec_t executable = nullptr;
+    if (cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0) != cudaSuccess || !executable) {
+        cudaGraphDestroy(graph);
+        return false;
+    }
+    m_CudaGraph = graph;
+    m_CudaGraphInstance = executable;
+    m_IsGraphCaptured = true;
     return true;
 }
 
 std::vector<Detection> YoloEngine::Detect(float conf_thresh) {
-    std::vector<Detection> finalDets;
-    if (!m_Context) return finalDets;
-
-    size_t inputBytes = 3 * INPUT_W * INPUT_H * sizeof(float);
-    size_t outputBytes = (4 + NUM_CLASSES) * NUM_ANCHORS * sizeof(float);
-
-    if (!m_IsGraphCaptured) {
-        checkCuda(cudaStreamBeginCapture(m_Stream, cudaStreamCaptureModeGlobal));
-        checkCuda(cudaMemcpyAsync(m_buffers[0], m_PinnedInput, inputBytes, cudaMemcpyHostToDevice, m_Stream));
-        m_Context->enqueueV3(m_Stream);
-        checkCuda(cudaMemcpyAsync(m_PinnedOutput, m_buffers[1], outputBytes, cudaMemcpyDeviceToHost, m_Stream));
-        checkCuda(cudaStreamEndCapture(m_Stream, &m_CudaGraph));
-        checkCuda(cudaGraphInstantiate(&m_CudaGraphInstance, m_CudaGraph, nullptr, nullptr, 0));
-        m_IsGraphCaptured = true;
+    std::vector<Detection> detections;
+    if (!m_Context || !m_Stream || !m_PinnedInput || !m_PinnedOutput) return detections;
+    if (!m_GraphAttempted) {
+        m_GraphAttempted = true;
+        if (!ExecuteDirect()) return detections;
+        if (!CaptureGraph()) std::cerr << "CUDA Graph unavailable; direct inference enabled\n";
     }
 
-    checkCuda(cudaGraphLaunch(m_CudaGraphInstance, m_Stream));
-    checkCuda(cudaStreamSynchronize(m_Stream));
+    bool inferenceOk = false;
+    if (m_IsGraphCaptured) {
+        inferenceOk = CheckCuda(cudaGraphLaunch(m_CudaGraphInstance, m_Stream), "graph launch") &&
+            CheckCuda(cudaStreamSynchronize(m_Stream), "graph synchronize");
+    }
+    else {
+        inferenceOk = ExecuteDirect();
+    }
+    if (!inferenceOk) return detections;
 
-    float* pOut = m_PinnedOutput;
-    int cols = NUM_ANCHORS;
+    const float* out = m_PinnedOutput;
+    const int n = NUM_ANCHORS;
+    std::vector<NMSBox> candidates;
+    candidates.reserve(n);
 
-    static std::vector<NMSBox> candidates;
-    candidates.clear();
-
-    for (int i = 0; i < cols; ++i) {
-        float maxScore = 0.0f;
-        int maxClassId = -1;
-
+    for (int i = 0; i < n; ++i) {
+        int label = -1;
+        float score = 0.0f;
         for (int c = 0; c < NUM_CLASSES; ++c) {
-            float score = pOut[(4 + c) * cols + i];
-            if (score > maxScore) {
-                maxScore = score;
-                maxClassId = c;
+            const float value = out[(4 + c) * n + i];
+            if (std::isfinite(value) && value > score) {
+                score = value;
+                label = c;
             }
         }
+        if (label < 0 || score < conf_thresh) continue;
 
-        if (maxScore > conf_thresh) {
-            float cx = pOut[i];
-            float cy = pOut[cols + i];
-            float w = pOut[2 * cols + i];
-            float h = pOut[3 * cols + i];
+        const float cx = out[i];
+        const float cy = out[n + i];
+        const float w = out[2 * n + i];
+        const float h = out[3 * n + i];
+        if (!std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(w) || !std::isfinite(h)) continue;
+        if (w < 1.0f || h < 1.0f) continue;
 
-            float x1 = cx - w * 0.5f;
-            float y1 = cy - h * 0.5f;
-            float x2 = x1 + w;
-            float y2 = y1 + h;
-
-            candidates.push_back({ x1, y1, x2, y2, maxScore, maxClassId, w * h });
-        }
+        const float x1 = std::clamp(cx - w * 0.5f, 0.0f, static_cast<float>(INPUT_W));
+        const float y1 = std::clamp(cy - h * 0.5f, 0.0f, static_cast<float>(INPUT_H));
+        const float x2 = std::clamp(cx + w * 0.5f, 0.0f, static_cast<float>(INPUT_W));
+        const float y2 = std::clamp(cy + h * 0.5f, 0.0f, static_cast<float>(INPUT_H));
+        if (x2 <= x1 || y2 <= y1) continue;
+        candidates.push_back({ x1, y1, x2, y2, score, (x2 - x1) * (y2 - y1), label });
     }
-
-    if (candidates.empty()) return finalDets;
 
     std::sort(candidates.begin(), candidates.end(), [](const NMSBox& a, const NMSBox& b) {
         return a.score > b.score;
         });
+    std::vector<uint8_t> suppressed(candidates.size(), 0);
+    detections.reserve(candidates.size());
 
-    const float nms_thresh = 0.45f;
-    size_t count = candidates.size();
-
-    static std::vector<bool> suppressed;
-    suppressed.assign(count, false);
-
-    for (size_t i = 0; i < count; ++i) {
+    for (size_t i = 0; i < candidates.size(); ++i) {
         if (suppressed[i]) continue;
+        const NMSBox& a = candidates[i];
+        const int left = std::clamp(static_cast<int>(std::floor(a.x1)), 0, INPUT_W - 1);
+        const int top = std::clamp(static_cast<int>(std::floor(a.y1)), 0, INPUT_H - 1);
+        const int right = std::clamp(static_cast<int>(std::ceil(a.x2)), 0, INPUT_W);
+        const int bottom = std::clamp(static_cast<int>(std::ceil(a.y2)), 0, INPUT_H);
+        if (right > left && bottom > top)
+            detections.push_back({ a.class_id, a.score, cv::Rect(left, top, right - left, bottom - top) });
 
-        NMSBox& b1 = candidates[i];
-        finalDets.push_back({ b1.class_id, b1.score, cv::Rect((int)b1.x1, (int)b1.y1, (int)(b1.x2 - b1.x1), (int)(b1.y2 - b1.y1)) });
-
-        for (size_t j = i + 1; j < count; ++j) {
+        for (size_t j = i + 1; j < candidates.size(); ++j) {
             if (suppressed[j]) continue;
-
-            NMSBox& b2 = candidates[j];
-
-            float xx1 = std::max(b1.x1, b2.x1);
-            float yy1 = std::max(b1.y1, b2.y1);
-            float xx2 = std::min(b1.x2, b2.x2);
-            float yy2 = std::min(b1.y2, b2.y2);
-
-            float w = std::max(0.0f, xx2 - xx1);
-            float h = std::max(0.0f, yy2 - yy1);
-            float inter = w * h;
-
-            if (inter > 0.0f) {
-                float unionArea = b1.area + b2.area - inter;
-                float iou = inter / unionArea;
-                if (iou > nms_thresh) suppressed[j] = true;
-            }
+            const NMSBox& b = candidates[j];
+            if (a.class_id != b.class_id) continue;
+            const float intersectionW = std::max(0.0f, std::min(a.x2, b.x2) - std::max(a.x1, b.x1));
+            const float intersectionH = std::max(0.0f, std::min(a.y2, b.y2) - std::max(a.y1, b.y1));
+            const float intersection = intersectionW * intersectionH;
+            const float denominator = a.area + b.area - intersection;
+            if (denominator > 0.0f && intersection / denominator > 0.45f) suppressed[j] = 1;
         }
     }
-
-    return finalDets;
+    return detections;
 }
